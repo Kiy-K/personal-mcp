@@ -13,11 +13,11 @@ standard, maintained by Prefect.
 Install: pip install "fastmcp[code-mode]" ddgs
 
 Local dev (stdio, for Claude Desktop / MCP Inspector):
-    fastmcp run app.py
+    fastmcp run server.py
 
 Remote / what ART needs a URL for (Streamable HTTP):
-    fastmcp run app.py --transport streamable-http --port 8000
-    # or just: python app.py
+    fastmcp run server.py --transport streamable-http --port 8000
+    # or just: python server.py
 
 Two runtime modes (toggle with the CODE_MODE_ENABLED env var):
   - default (CODE_MODE_ENABLED=0): tools are exposed behind a
@@ -32,8 +32,6 @@ Two runtime modes (toggle with the CODE_MODE_ENABLED env var):
     "write code to orchestrate tools" pattern.
 """
 
-from datetime import datetime, timedelta
-from typing import Optional, Any
 import ast
 import math
 import os
@@ -41,12 +39,14 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta
+from typing import Any
+
+from ddgs import DDGS
 from fastmcp import FastMCP
 from fastmcp.server.transforms import ToolTransform
-from fastmcp.tools.tool_transform import ToolTransformConfig
 from fastmcp.server.transforms.search import BM25SearchTransform
-from ddgs import DDGS
-
+from fastmcp.tools.tool_transform import ToolTransformConfig
 
 # -----------------------------------------------------------------
 # Transform configuration
@@ -194,8 +194,17 @@ if _CODE_MODE_ENABLED:
     # transform stays — CodeMode's GetTags uses the same tag data.
     _transforms = [_tool_tag_transform]
     from fastmcp.experimental.transforms.code_mode import (
-        CodeMode, MontySandboxProvider,
-        Search as CMSearch, GetSchemas as CMGetSchemas, GetTags as CMGetTags,
+        CodeMode,
+        MontySandboxProvider,
+    )
+    from fastmcp.experimental.transforms.code_mode import (
+        GetSchemas as CMGetSchemas,
+    )
+    from fastmcp.experimental.transforms.code_mode import (
+        GetTags as CMGetTags,
+    )
+    from fastmcp.experimental.transforms.code_mode import (
+        Search as CMSearch,
     )
     _sandbox = MontySandboxProvider(
         limits={"max_duration_secs": 10, "max_memory": 50_000_000},
@@ -253,7 +262,7 @@ def reset_state() -> str:
 # ===================================================================
 
 @mcp.tool
-def create_event(title: str, start_time: str, end_time: str, location: Optional[str] = None) -> dict:
+def create_event(title: str, start_time: str, end_time: str, location: str | None = None) -> dict:
     """Create a calendar event.
 
     Args:
@@ -293,7 +302,7 @@ def create_event(title: str, start_time: str, end_time: str, location: Optional[
 
 
 @mcp.tool
-def list_events(date: Optional[str] = None) -> list:
+def list_events(date: str | None = None) -> list:
     """List calendar events, optionally filtered to a single day.
 
     Args:
@@ -390,7 +399,7 @@ def cancel_event(event_id: int, confirm: bool = False) -> dict:
 # ===================================================================
 
 @mcp.tool
-def create_task(title: str, due_date: Optional[str] = None, priority: str = "normal") -> dict:
+def create_task(title: str, due_date: str | None = None, priority: str = "normal") -> dict:
     """Create a to-do task.
 
     Args:
@@ -410,7 +419,7 @@ def create_task(title: str, due_date: Optional[str] = None, priority: str = "nor
 
 
 @mcp.tool
-def list_tasks(status: Optional[str] = None) -> list:
+def list_tasks(status: str | None = None) -> list:
     """List tasks, optionally filtered by status ("open" or "done")."""
     tasks = list(_state["tasks"].values())
     if status:
@@ -434,7 +443,7 @@ def complete_task(task_id: int) -> dict:
 # ===================================================================
 
 @mcp.tool
-def create_note(title: str, content: str, tags: Optional[list] = None) -> dict:
+def create_note(title: str, content: str, tags: list | None = None) -> dict:
     """Save a short note.
 
     Args:
@@ -676,7 +685,7 @@ def create_task_item(task: str, status: str = "pending") -> dict:
 
 
 @mcp.tool
-def list_task_items(status: Optional[str] = None) -> list:
+def list_task_items(status: str | None = None) -> list:
     """List task queue entries, optionally filtered by status.
 
     Args:

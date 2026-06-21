@@ -5,7 +5,7 @@ Run: pytest test_app.py -v
 """
 import pytest
 
-import app
+import server as app
 
 
 @pytest.fixture(autouse=True)
