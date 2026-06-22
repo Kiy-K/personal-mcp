@@ -210,23 +210,27 @@ def test_run_python_timeout_clamped():
 # Transforms / server
 # -----------------------------------------------------------------
 
-def test_server_has_transforms():
-    """The default config should have ToolTransform + BM25SearchTransform."""
+def test_server_has_no_transforms_by_default():
+    """By default, all tools are exposed directly (no search proxy,
+    no tag transform). CodeMode is opt-in via env var."""
     assert app.mcp.name == "concierge-assistant"
-    assert len(app.mcp._transforms) == 2
+    assert app.mcp._transforms == []
 
 
-def test_tool_tags_applied():
-    """The ToolTransform should have added tags to registered tools."""
-    tag_transform = app.mcp._transforms[0]
-    # ToolTransform stores configs in its _transforms dict
-    calc_config = tag_transform._transforms.get("calculate")
-    assert calc_config is not None
-    assert "math" in calc_config.tags
-    assert calc_config.title == "Calculate Math Expression"
-
-    cancel_config = tag_transform._transforms.get("cancel_event")
-    assert "destructive" in cancel_config.tags
+def test_tools_directly_callable():
+    """All registered tools should be reachable by direct call —
+    not hidden behind a search/call proxy."""
+    # Just verify several tools are registered and callable
+    for tool_name in [
+        "create_event", "list_events", "create_task", "complete_task",
+        "create_note", "search_notes", "search", "search_and_extract",
+        "calculate", "write_scratchpad", "read_scratchpad",
+        "create_task_item", "list_task_items", "update_task_item",
+        "delete_task_item", "run_python", "current_time", "set_budget",
+        "get_action_count", "get_trajectory", "fetch_url", "extract_json",
+        "reset_state",
+    ]:
+        assert callable(getattr(app, tool_name)), f"{tool_name} not registered"
 
 
 # -----------------------------------------------------------------

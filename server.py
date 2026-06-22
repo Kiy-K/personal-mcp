@@ -20,10 +20,9 @@ Remote / what ART needs a URL for (Streamable HTTP):
     # or just: python server.py
 
 Two runtime modes (toggle with the CODE_MODE_ENABLED env var):
-  - default (CODE_MODE_ENABLED=0): tools are exposed behind a
-    BM25SearchTransform. Clients see three tools — search_tools,
-    call_tool, and reset_state (pinned) — and discover the rest
-    on demand.
+  - default (CODE_MODE_ENABLED=0): all tools are exposed directly.
+    Clients see the full catalog via list_tools() and can call any
+    tool by name.
   - code mode (CODE_MODE_ENABLED=1): tools are wrapped in
     CodeMode. Clients see four meta-tools — tags, search,
     get_schema, execute — and write Python that chains
@@ -46,186 +45,36 @@ from typing import Any
 import httpx
 from ddgs import DDGS
 from fastmcp import FastMCP
-from fastmcp.server.transforms import ToolTransform
-from fastmcp.server.transforms.search import BM25SearchTransform
-from fastmcp.tools.tool_transform import ToolTransformConfig
 from pydantic_monty import CollectString, Monty, MontyError, ResourceLimits
 
 # -----------------------------------------------------------------
 # Transform configuration
 # -----------------------------------------------------------------
-# We layer three FastMCP transforms on top of the registered tools:
+# We support one optional FastMCP transform:
 #
-# 1. ToolTransform — adds tool-level tags and a richer title to
-#    every tool. Tags drive both the BM25 search index and the
-#    CodeMode discovery tool (`GetTags`) if it's enabled, so good
-#    tags = better search ranking = better RL training signal.
-#    The transform is applied to each tool below in the
-#    _TOOL_TAGS dict.
+# CodeMode (optional) — when CODE_MODE_ENABLED=1, the server wraps
+# the catalog in a sandboxed Python execution environment. The LLM
+# sees only three meta-tools (search, get_schema, execute) and
+# writes Python code that chains call_tool() invocations. This is
+# the "code mode" pattern from Cloudflare / Anthropic — useful for
+# teaching the orchestrator to synthesize procedural code instead
+# of making many sequential tool calls. Disabled by default because
+# it masks the individual tools, which makes per-tool RL credit
+# assignment harder. Enable it for episodes that specifically target
+# code-mode behavior.
 #
-# 2. BM25SearchTransform — replaces the flat tool listing with
-#    two synthetic tools, `search_tools` and `call_tool`. The
-#    LLM learns to discover tools on-demand by natural-language
-#    query, rather than receiving the full catalog in context.
-#    The original tools remain fully callable through the
-#    `call_tool` proxy and through MCP's direct tool calls.
-#
-# 3. CodeMode (optional) — when CODE_MODE_ENABLED=1, the server
-#    additionally wraps the catalog in a sandboxed Python
-#    execution environment. The LLM sees only three meta-tools
-#    (search, get_schema, execute) and writes Python code that
-#    chains call_tool() invocations. This is the "code mode"
-#    pattern from Cloudflare / Anthropic — useful for teaching
-#    the orchestrator to synthesize procedural code instead of
-#    making many sequential tool calls. Disabled by default
-#    because it masks the individual tools, which makes
-#    per-tool RL credit assignment harder. Enable it for
-#    episodes that specifically target code-mode behavior.
+# We previously layered BM25SearchTransform and ToolTransform on
+# top of the catalog, but the search proxy hid the individual tools
+# from list_tools() and was unstable across clients. The tools are
+# now exposed directly — clients see the full catalog and can call
+# any tool by name.
 # -----------------------------------------------------------------
 
 _CODE_MODE_ENABLED = os.environ.get("CODE_MODE_ENABLED", "0") == "1"
 
-_search_transform = BM25SearchTransform(
-    max_results=8,
-    always_visible=["reset_state"],
-)
-
-_tool_tag_transform = ToolTransform({
-    # Calendar
-    "create_event": ToolTransformConfig(
-        title="Create Calendar Event",
-        tags={"calendar", "write"},
-    ),
-    "list_events": ToolTransformConfig(
-        title="List Calendar Events",
-        tags={"calendar", "read"},
-    ),
-    "find_free_slots": ToolTransformConfig(
-        title="Find Free Time Slots",
-        tags={"calendar", "read", "planning"},
-    ),
-    "reschedule_event": ToolTransformConfig(
-        title="Reschedule Event",
-        tags={"calendar", "write"},
-    ),
-    "cancel_event": ToolTransformConfig(
-        title="Cancel Event",
-        tags={"calendar", "write", "destructive"},
-    ),
-    # To-do tasks
-    "create_task": ToolTransformConfig(
-        title="Create To-Do Task",
-        tags={"todo", "write"},
-    ),
-    "list_tasks": ToolTransformConfig(
-        title="List To-Do Tasks",
-        tags={"todo", "read"},
-    ),
-    "complete_task": ToolTransformConfig(
-        title="Complete To-Do Task",
-        tags={"todo", "write"},
-    ),
-    # Notes
-    "create_note": ToolTransformConfig(
-        title="Create Note",
-        tags={"notes", "write"},
-    ),
-    "search_notes": ToolTransformConfig(
-        title="Search Notes",
-        tags={"notes", "read", "search"},
-    ),
-    # Search
-    "search": ToolTransformConfig(
-        title="Web Search",
-        tags={"search", "web", "read"},
-    ),
-    "search_and_extract": ToolTransformConfig(
-        title="News Search with Date and Source",
-        tags={"search", "web", "news", "read"},
-    ),
-    # Calculator
-    "calculate": ToolTransformConfig(
-        title="Calculate Math Expression",
-        tags={"math", "compute", "read"},
-    ),
-    # Scratchpad
-    "write_scratchpad": ToolTransformConfig(
-        title="Write Scratchpad",
-        tags={"memory", "write"},
-    ),
-    "read_scratchpad": ToolTransformConfig(
-        title="Read Scratchpad",
-        tags={"memory", "read"},
-    ),
-    "clear_scratchpad": ToolTransformConfig(
-        title="Clear Scratchpad",
-        tags={"memory", "write"},
-    ),
-    # Task queue
-    "create_task_item": ToolTransformConfig(
-        title="Create Task Queue Item",
-        tags={"planning", "write", "task-queue"},
-    ),
-    "list_task_items": ToolTransformConfig(
-        title="List Task Queue Items",
-        tags={"planning", "read", "task-queue"},
-    ),
-    "update_task_item": ToolTransformConfig(
-        title="Update Task Queue Item",
-        tags={"planning", "write", "task-queue"},
-    ),
-    "delete_task_item": ToolTransformConfig(
-        title="Delete Task Queue Item",
-        tags={"planning", "write", "destructive", "task-queue"},
-    ),
-    # Code execution
-    "run_python": ToolTransformConfig(
-        title="Run Python Code",
-        tags={"code", "compute", "sandbox"},
-    ),
-    # Meta tools — time, budget, trajectory
-    "current_time": ToolTransformConfig(
-        title="Current Time",
-        tags={"meta", "read", "time"},
-    ),
-    "set_budget": ToolTransformConfig(
-        title="Set Action Budget",
-        tags={"meta", "write", "budget"},
-    ),
-    "get_action_count": ToolTransformConfig(
-        title="Get Action Count",
-        tags={"meta", "read", "budget"},
-    ),
-    "get_budget_status": ToolTransformConfig(
-        title="Get Budget Status",
-        tags={"meta", "read", "budget"},
-    ),
-    "get_trajectory": ToolTransformConfig(
-        title="Get Trajectory Log",
-        tags={"meta", "read", "trajectory"},
-    ),
-    # Extraction tools
-    "fetch_url": ToolTransformConfig(
-        title="Fetch URL Content",
-        tags={"fetch", "web", "read"},
-    ),
-    "extract_json": ToolTransformConfig(
-        title="Extract JSON from Text",
-        tags={"parse", "read"},
-    ),
-    # reset_state is intentionally NOT tagged here — it stays
-    # pinned in the BM25 always_visible list above.
-})
-
-_transforms = [_tool_tag_transform, _search_transform]
+_transforms: list = []
 
 if _CODE_MODE_ENABLED:
-    # CodeMode and BM25SearchTransform are mutually exclusive at the
-    # same layer: both want to own the tool listing. When code mode
-    # is on, we drop the BM25 search proxy and let CodeMode expose
-    # its own search/get_schema/execute meta-tools. The tool-tag
-    # transform stays — CodeMode's GetTags uses the same tag data.
-    _transforms = [_tool_tag_transform]
     from fastmcp.experimental.transforms.code_mode import (
         CodeMode,
         MontySandboxProvider,
