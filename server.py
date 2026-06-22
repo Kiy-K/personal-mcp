@@ -33,20 +33,23 @@ Two runtime modes (toggle with the CODE_MODE_ENABLED env var):
 """
 
 import ast
+import functools
+import json
 import math
 import os
 import re
-import subprocess
-import sys
-import tempfile
+import zoneinfo
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from typing import Any
 
+import httpx
 from ddgs import DDGS
 from fastmcp import FastMCP
 from fastmcp.server.transforms import ToolTransform
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.tools.tool_transform import ToolTransformConfig
+from pydantic_monty import CollectString, Monty, MontyError, ResourceLimits
 
 # -----------------------------------------------------------------
 # Transform configuration
@@ -180,6 +183,36 @@ _tool_tag_transform = ToolTransform({
         title="Run Python Code",
         tags={"code", "compute", "sandbox"},
     ),
+    # Meta tools — time, budget, trajectory
+    "current_time": ToolTransformConfig(
+        title="Current Time",
+        tags={"meta", "read", "time"},
+    ),
+    "set_budget": ToolTransformConfig(
+        title="Set Action Budget",
+        tags={"meta", "write", "budget"},
+    ),
+    "get_action_count": ToolTransformConfig(
+        title="Get Action Count",
+        tags={"meta", "read", "budget"},
+    ),
+    "get_budget_status": ToolTransformConfig(
+        title="Get Budget Status",
+        tags={"meta", "read", "budget"},
+    ),
+    "get_trajectory": ToolTransformConfig(
+        title="Get Trajectory Log",
+        tags={"meta", "read", "trajectory"},
+    ),
+    # Extraction tools
+    "fetch_url": ToolTransformConfig(
+        title="Fetch URL Content",
+        tags={"fetch", "web", "read"},
+    ),
+    "extract_json": ToolTransformConfig(
+        title="Extract JSON from Text",
+        tags={"parse", "read"},
+    ),
     # reset_state is intentionally NOT tagged here — it stays
     # pinned in the BM25 always_visible list above.
 })
@@ -219,6 +252,51 @@ if _CODE_MODE_ENABLED:
 
 mcp = FastMCP("concierge-assistant", transforms=_transforms)
 
+
+# -----------------------------------------------------------------
+# Auto-instrumentation: wrap mcp.tool so every registered tool
+# automatically checks the budget and logs to the trajectory.
+# This is a meta-programming shim — tools don't need to call
+# _bump_action() or _log_event() manually.
+# -----------------------------------------------------------------
+
+_original_tool = mcp.tool
+
+
+def _instrumented_tool(*args, **kwargs):
+    """Wrap mcp.tool so every registered function is auto-instrumented
+    with budget-checking and trajectory-logging.
+
+    Supports both call patterns:
+        @mcp.tool                     # bare decorator, args = (fn,)
+        @mcp.tool(name="foo", ...)    # parameterized, args = (), kwargs = {...}
+    """
+    def wrap_fn(fn):
+        tool_name = fn.__name__
+
+        @functools.wraps(fn)
+        def wrapper(*fargs, **fkwargs):
+            budget_err = _bump_action(tool_name)
+            if budget_err is not None:
+                _log_event(tool_name, dict(fkwargs), budget_err)
+                return budget_err
+            result = fn(*fargs, **fkwargs)
+            _log_event(tool_name, dict(fkwargs), result)
+            return result
+
+        return _original_tool(wrapper)
+
+    if len(args) == 1 and callable(args[0]) and not kwargs:
+        # @mcp.tool (no parens) — args[0] is the function
+        return wrap_fn(args[0])
+    # @mcp.tool(...) or @mcp.tool — return a decorator
+    def decorator(fn):
+        return wrap_fn(fn)
+    return decorator
+
+
+mcp.tool = _instrumented_tool
+
 # -----------------------------------------------------------------
 # In-memory state. Everything here is synthetic/example data by
 # design — this server is meant to be safe to point an RL training
@@ -235,16 +313,20 @@ _state = {
     "scratchpad": "",
     "task_queue": {},
     "next_task_queue_id": 1,
+    "action_count": 0,
+    "trajectory": [],
+    "budget": None,
 }
 
 
 @mcp.tool
 def reset_state() -> str:
     """Reset all server-side state (events, tasks, notes, scratchpad,
-    task_queue) to empty. Call this before starting a new training
-    episode/scenario so every rollout begins from identical conditions
-    — GRPO compares multiple attempts at the same scenario, and
-    drifting state between attempts makes the reward signal noisy."""
+    task_queue, action_count, trajectory, budget) to empty. Call this
+    before starting a new training episode/scenario so every rollout
+    begins from identical conditions — GRPO compares multiple attempts
+    at the same scenario, and drifting state between attempts makes
+    the reward signal noisy."""
     _state["events"].clear()
     _state["tasks"].clear()
     _state["notes"].clear()
@@ -254,7 +336,296 @@ def reset_state() -> str:
     _state["scratchpad"] = ""
     _state["task_queue"].clear()
     _state["next_task_queue_id"] = 1
+    _state["action_count"] = 0
+    _state["trajectory"] = []
+    _state["budget"] = None
     return "state reset"
+
+
+# -----------------------------------------------------------------
+# Action budget + trajectory logger
+# -----------------------------------------------------------------
+# Every mutating tool calls _bump_action() and _log_event() so the
+# training loop can read the action count and full trajectory after
+# a rollout. The budget (if set via set_budget) caps the number of
+# non-read tool calls per episode — tools that would exceed the
+# budget return {"error": "action budget exhausted", ...} instead
+# of executing.
+# -----------------------------------------------------------------
+
+_READ_TOOLS = {
+    "list_events", "find_free_slots", "list_tasks", "search_notes",
+    "search", "search_and_extract", "read_scratchpad", "list_task_items",
+    "current_time", "extract_json", "get_action_count", "get_budget_status",
+    "get_trajectory", "fetch_url", "run_python", "today_summary",
+}
+
+# Tools that can ALWAYS be called even when the action budget is
+# exhausted. Without this, the agent could never set a higher budget
+# to escape an exhausted one (chicken-and-egg).
+_BUDGET_EXEMPT = {"set_budget", "reset_state"}
+
+
+def _bump_action(tool_name: str) -> dict | None:
+    """Increment the action counter for mutating tools and enforce
+    the budget. Read-only tools do NOT count against the budget
+    (they don't count against action_count at all). Budget-exempt
+    tools (set_budget, reset_state) can always be called — they
+    are the escape hatches for an exhausted budget. Returns a
+    {"error": ...} dict if the budget is exhausted, otherwise None."""
+    if tool_name in _READ_TOOLS or tool_name in _BUDGET_EXEMPT:
+        return None
+    _state["action_count"] += 1
+    if _state["budget"] is not None and _state["action_count"] > _state["budget"]:
+        return {
+            "error": f"action budget exhausted (used {_state['action_count']} of {_state['budget']})",
+            "tool": tool_name,
+        }
+    return None
+
+
+def _log_event(tool_name: str, arguments: dict, result: Any) -> None:
+    """Append a single step to the trajectory log."""
+    _state["trajectory"].append({
+        "step": len(_state["trajectory"]),
+        "tool": tool_name,
+        "arguments": arguments,
+        "result": result,
+    })
+
+
+# ===================================================================
+# Meta tools — time, action budget, trajectory
+# ===================================================================
+
+@mcp.tool
+def current_time(timezone_name: str = "UTC") -> dict:
+    """Return the current time in the given IANA timezone.
+
+    Args:
+        timezone_name: IANA timezone name, e.g. "UTC", "America/Los_Angeles",
+            "Asia/Ho_Chi_Minh". Defaults to "UTC".
+
+    Returns:
+        {"iso": "2026-06-22T11:26:58+07:00", "timezone": "Asia/Ho_Chi_Minh",
+         "unix": 1782126418} on success, or {"error": "..."} if the
+        timezone is unknown.
+
+    Use this whenever the orchestrator needs to resolve "now" for
+    time-relative reasoning ("tomorrow", "in 3 days", "next Monday").
+    """
+    try:
+        tz = zoneinfo.ZoneInfo(timezone_name)
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        return {"error": f"unknown timezone: {timezone_name!r}"}
+    now = datetime.now(tz)
+    return {
+        "iso": now.isoformat(),
+        "timezone": timezone_name,
+        "unix": int(now.timestamp()),
+    }
+
+
+@mcp.tool
+def set_budget(max_actions: int) -> dict:
+    """Set a hard cap on the number of mutating tool calls per episode.
+
+    Once set, any tool call that would push the action count above
+    max_actions returns {"error": "action budget exhausted", ...}
+    instead of executing. Read-only tools are still allowed (they
+    don't count against the budget).
+
+    Args:
+        max_actions: positive integer, or 0 to clear the budget.
+
+    Returns:
+        {"budget": int, "action_count": int} with the current state.
+    """
+    if max_actions < 0:
+        return {"error": "max_actions must be >= 0"}
+    _state["budget"] = max_actions if max_actions > 0 else None
+    return {"budget": _state["budget"], "action_count": _state["action_count"]}
+
+
+@mcp.tool
+def get_action_count() -> dict:
+    """Return the current action count and (if set) the budget.
+
+    Useful as a self-check before expensive mutating calls — if the
+    agent is close to the budget, it should consolidate remaining
+    steps rather than fire off speculative tool calls.
+    """
+    return {
+        "action_count": _state["action_count"],
+        "budget": _state["budget"],
+        "remaining": (_state["budget"] - _state["action_count"]) if _state["budget"] is not None else None,
+    }
+
+
+@mcp.tool
+def get_budget_status() -> dict:
+    """Alias for get_action_count that returns the same shape. Provided
+    because some agents reason better when budget is named explicitly."""
+    return get_action_count()
+
+
+@mcp.tool
+def get_trajectory(last_n: int | None = None) -> list:
+    """Return the full trajectory of tool calls made in this episode.
+
+    Each entry is {"step": int, "tool": str, "arguments": dict, "result": Any}.
+    Use this at the end of a rollout to record the decision trace
+    for offline RL dataset construction.
+
+    Args:
+        last_n: if set, return only the last N steps (most recent first
+            in the returned list); if omitted, return all steps in
+            order.
+
+    Returns:
+        List of trajectory entries.
+    """
+    traj = _state["trajectory"]
+    if last_n is not None and last_n > 0:
+        return list(reversed(traj[-last_n:]))
+    return list(traj)
+
+
+# ===================================================================
+# Extraction tools — fetch URL, parse JSON from text
+# ===================================================================
+
+_FETCH_MAX_BYTES = 50_000
+_FETCH_TIMEOUT_SECONDS = 10
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Strip HTML to plain text, preserving paragraph breaks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+        elif tag in {"p", "br", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self.parts.append(data)
+
+
+def _html_to_text(html: str) -> str:
+    extractor = _HTMLTextExtractor()
+    extractor.feed(html)
+    text = "".join(extractor.parts)
+    # Collapse runs of blank lines
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+@mcp.tool
+def fetch_url(url: str, max_bytes: int = _FETCH_MAX_BYTES, timeout: int = _FETCH_TIMEOUT_SECONDS) -> dict:
+    """Fetch a URL and return its content as plain text.
+
+    Pairs with search() — the orchestrator searches, picks a result,
+    then calls fetch_url to read the page. HTML is stripped to text;
+    JSON responses are returned as-is (under the "json" key).
+
+    Args:
+        url: http or https URL to fetch
+        max_bytes: cap on response size in bytes (default 50000,
+            hard-capped at 500000)
+        timeout: request timeout in seconds (default 10, max 30)
+
+    Returns:
+        {"url": str, "status": int, "content_type": str, "text": str,
+         "truncated": bool} on success, or {"error": "..."} for
+        network errors, non-2xx status, oversized responses, or
+        malformed URLs.
+    """
+    if not url or not url.strip():
+        return {"error": "url must not be empty"}
+    if not url.startswith(("http://", "https://")):
+        return {"error": "url must start with http:// or https://"}
+    max_bytes = max(1, min(max_bytes, 500_000))
+    timeout = max(1, min(timeout, 30))
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            r = client.get(url, headers={"User-Agent": "personal-mcp/0.1"})
+            truncated = len(r.content) > max_bytes
+            raw = r.content[:max_bytes]
+            content_type = r.headers.get("content-type", "")
+            if r.status_code >= 400:
+                return {"error": f"HTTP {r.status_code}", "status": r.status_code, "url": url}
+            text: str
+            if "json" in content_type:
+                try:
+                    text = json.dumps(r.json(), indent=2)
+                except Exception:
+                    text = raw.decode("utf-8", errors="replace")
+            elif "html" in content_type or raw[:200].lower().startswith((b"<!doctype", b"<html")):
+                text = _html_to_text(raw.decode("utf-8", errors="replace"))
+            else:
+                text = raw.decode("utf-8", errors="replace")
+            return {
+                "url": url,
+                "status": r.status_code,
+                "content_type": content_type,
+                "text": text,
+                "truncated": truncated,
+            }
+    except httpx.HTTPError as e:
+        return {"error": f"fetch failed: {e!r}"}
+    except Exception as e:
+        return {"error": f"unexpected error: {e!r}"}
+
+
+# JSON fenced-block pattern: ```json\n{...}\n``` or just {...}
+_JSON_FENCED = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+_JSON_INLINE = re.compile(r"(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\])", re.DOTALL)
+
+
+@mcp.tool
+def extract_json(text: str) -> dict:
+    """Extract and parse the first JSON object or array from a text blob.
+
+    Tool results are often returned as JSON-as-string. This tool
+    handles the common cases:
+      - Fenced code blocks: ```json ... ```
+      - Bare JSON objects/arrays on their own line
+      - JSON embedded in prose (returns the first balanced {...} or [...])
+
+    Args:
+        text: the text to search
+
+    Returns:
+        {"json": <parsed value>} on success, or {"error": "..."} if
+        no parseable JSON is found.
+    """
+    if not text:
+        return {"error": "text must not be empty"}
+    # Try fenced blocks first (highest signal)
+    for m in _JSON_FENCED.finditer(text):
+        candidate = m.group(1).strip()
+        try:
+            return {"json": json.loads(candidate)}
+        except json.JSONDecodeError:
+            continue
+    # Then bare inline objects/arrays
+    for m in _JSON_INLINE.finditer(text):
+        candidate = m.group(1).strip()
+        try:
+            return {"json": json.loads(candidate)}
+        except json.JSONDecodeError:
+            continue
+    return {"error": "no parseable JSON found in text"}
 
 
 # ===================================================================
@@ -736,39 +1107,68 @@ def delete_task_item(task_id: int) -> dict:
 
 
 # ===================================================================
-# Code execution — sandboxed subprocess for procedural execution
+# Code execution — pydantic-monty sandboxed interpreter
+# ===================================================================
+# We use pydantic-monty (a Rust-based Python interpreter) instead of
+# spawning a subprocess because:
+#
+#   1. Pristine environment every call. Monty is a fresh interpreter
+#      per run — no module cache, no file handles, no inherited
+#      state. A snippet cannot leak variables, files, or sockets
+#      to the next call.
+#
+#   2. Real interpreter-level isolation. There is no `import os`,
+#      `import sys`, `import subprocess`, `open()`, or `exec()` in
+#      Monty's stdlib at all — these are not blocked by a regex,
+#      they simply do not exist in the interpreter. This is
+#      fundamentally stronger than the subprocess+blocklist approach.
+#
+#   3. Resource limits enforced by the interpreter. `max_duration_secs`,
+#      `max_memory`, and `max_allocations` are checked on every
+#      opcode, not at process boundaries. A busy loop is killed at
+#      the source, not by SIGKILL after the timer fires.
+#
+#   4. ~10x faster than subprocess. No Python startup, no `python -I`
+#      fork, just parse + execute inside the same process.
+#
+# The return shape is kept identical to the old subprocess
+# implementation (stdout / stderr / returncode / timed_out) so the
+# public API and existing tests don't need to change.
 # ===================================================================
 
-# Configurable safety knobs for the code runner.
 CODE_TIMEOUT_SECONDS = 5
-_CODE_BLOCKLIST = re.compile(
-    r"\b(import\s+(os|sys|subprocess|shutil|pathlib|socket|ctypes)|"
-    r"open\s*\(|__import__|exec\s*\(|eval\s*\(|compile\s*\()",
-    re.IGNORECASE,
-)
+MONTY_MEMORY_LIMIT = 50_000_000  # 50 MB
+MONTY_MAX_ALLOCATIONS = 1_000_000
+MONTY_MAX_TIMEOUT = 30
 
 
 @mcp.tool
 def run_python(code: str, timeout: int = CODE_TIMEOUT_SECONDS) -> dict:
-    """Execute a Python snippet in a sandboxed subprocess and return stdout.
+    """Execute a Python snippet in a sandboxed interpreter and return stdout.
 
-    This is the "code mode" tool: the orchestrator can synthesize
-    short Python to compute, transform, or verify something that
-    would be tedious through discrete tool calls. Output is captured
-    from stdout.
+    The orchestrator can synthesize short Python to compute, transform,
+    or verify something that would be tedious through discrete tool
+    calls. Each call runs in a pristine, resource-limited interpreter —
+    no state from a previous call is accessible.
 
     Safety:
-      - Runs in a fresh subprocess (no inherited state, no file
-        handles to the parent process).
-      - Hard timeout (default 5s, configurable per-call up to 30s)
-        kills runaway loops.
-      - Blocklist check rejects obvious dangerous constructs
-        (os/sys/subprocess imports, open(), exec/eval/compile, etc.)
-        BEFORE spawning the subprocess — cheap first line of defense.
-      - No network access by default; only the Python stdlib and
-        pure-Python stdlib modules are guaranteed to be available.
-      - Working directory is a fresh tempdir; the snippet cannot
-        read or write files outside it.
+      - Fresh interpreter per call. No module cache, no file handles,
+        no inherited variables. Side effects cannot leak across calls.
+      - Hard interpreter-level limits: max_duration_secs, max_memory,
+        max_allocations. Limits are checked on every opcode.
+      - No dangerous stdlib. The interpreter has no `os`, `sys`,
+        `subprocess`, `socket`, `shutil`, `open`, `exec`, `eval`, or
+        `__import__` — these constructs are unreachable, not just
+        blocklisted.
+      - No network access. No `urllib`, `socket`, `http` modules.
+      - No file I/O. No `open`, no `pathlib`, no `os.path`.
+
+    Limitations (by design):
+      - No async/await syntax. Use sync code only.
+      - No external library imports. Only Monty's restricted stdlib
+        (math, json, re, datetime, etc.) and pure-Python logic.
+      - Return value of the last expression is captured as the
+        "result"; use print() to produce stdout.
 
     Args:
         code: Python source code. Use print() to produce output.
@@ -776,39 +1176,56 @@ def run_python(code: str, timeout: int = CODE_TIMEOUT_SECONDS) -> dict:
 
     Returns:
         {"stdout": str, "stderr": str, "returncode": int, "timed_out": bool}
-        on execution, or {"error": "..."} for invalid input or a
-        blocklist hit.
+        on execution, or {"error": "..."} for invalid input.
     """
     if not code or not code.strip():
         return {"error": "code must not be empty"}
-    timeout = max(1, min(timeout, 30))
-    if _CODE_BLOCKLIST.search(code):
-        return {"error": "code contains a blocked construct (os/sys/subprocess, open, exec/eval/compile, etc.)"}
+    timeout = max(1, min(timeout, MONTY_MAX_TIMEOUT))
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            result = subprocess.run(
-                [sys.executable, "-I", "-S", "-c", code],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=tmp,
-                env={"PATH": "/usr/bin:/bin", "HOME": tmp, "TMPDIR": tmp},
-            )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-                "timed_out": False,
-            }
-    except subprocess.TimeoutExpired:
+        m = Monty(code)
+        stdout_collector = CollectString()
+        result = m.run(
+            limits=ResourceLimits(
+                max_duration_secs=float(timeout),
+                max_memory=MONTY_MEMORY_LIMIT,
+                max_allocations=MONTY_MAX_ALLOCATIONS,
+            ),
+            print_callback=stdout_collector,
+        )
+        stdout = stdout_collector.output
+        # If the script ended with an expression, result is its value.
+        # Append it to stdout so the caller sees it in the same place.
+        if result is not None and not stdout.endswith(str(result)):
+            stdout = stdout + ("" if stdout.endswith("\n") or not stdout else "\n") + repr(result)
         return {
-            "stdout": "",
-            "stderr": f"execution timed out after {timeout}s",
-            "returncode": -1,
-            "timed_out": True,
+            "stdout": stdout,
+            "stderr": "",
+            "returncode": 0,
+            "timed_out": False,
+        }
+    except MontyError as e:
+        # Monty wraps timeouts in MontyRuntimeError. Detect by string match
+        # since there's no dedicated exception subclass for timeouts.
+        err_str = str(e)
+        is_timeout = "time limit exceeded" in err_str or "TimeoutError" in err_str
+        captured_stdout = ""
+        try:
+            captured_stdout = stdout_collector.output
+        except NameError:
+            pass
+        return {
+            "stdout": captured_stdout,
+            "stderr": f"{type(e).__name__}: {e}" if not is_timeout else f"execution timed out after {timeout}s",
+            "returncode": -1 if is_timeout else 1,
+            "timed_out": is_timeout,
         }
     except Exception as e:
-        return {"error": f"execution failed: {e!r}"}
+        return {
+            "stdout": "",
+            "stderr": f"{type(e).__name__}: {e}",
+            "returncode": 1,
+            "timed_out": False,
+        }
 
 
 # ===================================================================

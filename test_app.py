@@ -177,12 +177,21 @@ def test_run_python_empty_rejected():
 
 
 def test_run_python_blocks_dangerous_imports():
-    assert "error" in app.run_python("import os")
-    assert "error" in app.run_python("import subprocess")
-    assert "error" in app.run_python("import socket")
-    assert "error" in app.run_python("open('/etc/passwd')")
-    assert "error" in app.run_python("exec('print(1)')")
-    assert "error" in app.run_python("eval('1+1')")
+    # pydantic-monty: dangerous imports are unreachable in the interpreter
+    # itself. `import os` is a no-op (returns 0), `open()` raises
+    # NameError because the name doesn't exist. The orchestrator
+    # should learn to handle these as execution failures, not to
+    # expect a pre-flight "blocked construct" error.
+    assert "error" in app.run_python("")  # empty is the only pre-flight error
+    r = app.run_python("import os")
+    # import os is silently allowed but harmless (no actual os module)
+    assert r["returncode"] == 0
+    r = app.run_python("open('/etc/passwd')")
+    assert r["returncode"] != 0  # NameError: open is not defined
+    r = app.run_python("exec('print(1)')")
+    assert r["returncode"] != 0  # NameError: exec is not defined
+    r = app.run_python("eval('1+1')")
+    assert r["returncode"] != 0
 
 
 def test_run_python_timeout():
@@ -218,3 +227,150 @@ def test_tool_tags_applied():
 
     cancel_config = tag_transform._transforms.get("cancel_event")
     assert "destructive" in cancel_config.tags
+
+
+# -----------------------------------------------------------------
+# Meta tools — current_time, action budget, trajectory
+# -----------------------------------------------------------------
+
+def test_current_time_utc():
+    r = app.current_time("UTC")
+    assert "iso" in r
+    assert "timezone" in r
+    assert "unix" in r
+    assert r["timezone"] == "UTC"
+    assert r["iso"].endswith("+00:00")
+
+
+def test_current_time_named_tz():
+    r = app.current_time("Asia/Ho_Chi_Minh")
+    assert r["timezone"] == "Asia/Ho_Chi_Minh"
+    # +07:00 offset
+    assert "+07:00" in r["iso"]
+
+
+def test_current_time_bad_tz():
+    r = app.current_time("Mars/Olympus")
+    assert "error" in r
+
+
+def test_action_count_starts_at_zero():
+    r = app.get_action_count()
+    assert r["action_count"] == 0
+    assert r["budget"] is None
+    assert r["remaining"] is None
+
+
+def test_set_budget_enforces_cap():
+    app.set_budget(2)
+    r = app.create_task("t1")  # mutating, counts
+    assert r["id"] == 1
+    app.create_task("t2")  # mutating, counts
+    # Third mutating call should fail
+    r = app.create_task("t3")
+    assert "error" in r
+    assert "budget exhausted" in r["error"]
+    # Read-only tools should still work
+    r = app.list_tasks()
+    assert isinstance(r, list)
+
+
+def test_set_budget_zero_clears():
+    # set_budget is exempt from counting, so action_count stays at 0
+    # after set_budget(1). t1 -> action_count=1 (within budget), t2
+    # would be action_count=2 (exceeds), so blocked. set_budget(0)
+    # clears the budget (also exempt), so t3 succeeds with id 2.
+    app.set_budget(1)
+    r1 = app.create_task("t1")
+    assert r1["id"] == 1
+    r2 = app.create_task("t2")
+    assert "error" in r2  # budget exhausted
+    app.set_budget(0)  # clears budget
+    r3 = app.create_task("t3")
+    assert r3["id"] == 2  # t1 was id 1, t2 was blocked, t3 gets id 2
+
+
+def test_get_trajectory_records_tool_calls():
+    app.create_task("trajectory-test")
+    app.calculate("1 + 1")
+    traj = app.get_trajectory()
+    # The fixture calls reset_state first, so trajectory has at least 3 entries
+    assert len(traj) >= 3
+    tool_names = [e["tool"] for e in traj]
+    assert "create_task" in tool_names
+    assert "calculate" in tool_names
+    # Each entry has the required shape
+    for entry in traj:
+        assert "step" in entry
+        assert "tool" in entry
+        assert "arguments" in entry
+        assert "result" in entry
+
+
+def test_get_trajectory_last_n():
+    app.create_task("a")
+    app.create_task("b")
+    app.create_task("c")
+    last_two = app.get_trajectory(last_n=2)
+    assert len(last_two) == 2
+    # Returned most-recent-first
+    assert last_two[0]["tool"] == "create_task"
+    assert last_two[1]["tool"] == "create_task"
+
+
+# -----------------------------------------------------------------
+# fetch_url
+# -----------------------------------------------------------------
+
+def test_fetch_url_empty():
+    r = app.fetch_url("")
+    assert "error" in r
+
+
+def test_fetch_url_bad_scheme():
+    r = app.fetch_url("ftp://example.com")
+    assert "error" in r
+
+
+def test_fetch_url_real():
+    """Hit a real URL (httpbin.org /example endpoint) to verify the
+    fetch path works end-to-end. Skipped if no network."""
+    r = app.fetch_url("https://example.com", max_bytes=10000, timeout=10)
+    if "error" in r and "fetch failed" in r["error"]:
+        pytest.skip(f"no network: {r['error']}")
+    assert r["status"] == 200
+    assert "Example Domain" in r["text"] or "example" in r["text"].lower()
+
+
+# -----------------------------------------------------------------
+# extract_json
+# -----------------------------------------------------------------
+
+def test_extract_json_fenced():
+    r = app.extract_json('```json\n{"a": 1, "b": [2, 3]}\n```')
+    assert r["json"] == {"a": 1, "b": [2, 3]}
+
+
+def test_extract_json_bare_object():
+    r = app.extract_json('Here is the data: {"x": 10, "y": 20}')
+    assert r["json"] == {"x": 10, "y": 20}
+
+
+def test_extract_json_array():
+    r = app.extract_json("results: [1, 2, 3]")
+    assert r["json"] == [1, 2, 3]
+
+
+def test_extract_json_nested():
+    r = app.extract_json('```\n{"outer": {"inner": [1, 2]}}\n```')
+    assert r["json"] == {"outer": {"inner": [1, 2]}}
+
+
+def test_extract_json_no_json():
+    r = app.extract_json("this text has no structured data")
+    assert "error" in r
+
+
+def test_extract_json_empty():
+    r = app.extract_json("")
+    assert "error" in r
